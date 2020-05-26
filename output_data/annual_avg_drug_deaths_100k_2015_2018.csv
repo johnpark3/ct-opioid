@@ -1,0 +1,13 @@
+level,name,is_opioid,total_n,avg_annual_age_adj
+state,Connecticut,all_drugs,3423,24.18307338746987
+state,Connecticut,opioids_only,3202,22.77200957911601
+regions,Rural,all_drugs,407,24.87450716097853
+regions,Rural,opioids_only,384,23.68177062179512
+regions,Suburban,all_drugs,631,18.6750148857847
+regions,Suburban,opioids_only,600,17.953770188444402
+regions,Urban core,all_drugs,951,40.405605999437384
+regions,Urban core,opioids_only,874,37.11191647686951
+regions,Urban periphery,all_drugs,1388,25.41291602971158
+regions,Urban periphery,opioids_only,1301,23.890043201426895
+regions,Wealthy,all_drugs,46,9.201738102849735
+regions,Wealthy,opioids_only,43,8.78466562123314

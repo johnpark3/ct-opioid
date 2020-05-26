@@ -1,0 +1,162 @@
+---
+title: "Drug/opioid overdoses"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	dpi = 300
+)
+```
+
+```{r}
+library(tidyverse)
+library(camiller)
+library(cwi)
+library(tsibble)
+library(lubridate)
+
+source("../../_utils/misc_functions.R")
+```
+
+
+Redoing some analysis in order to get this by 5CT region. 
+
+Copy individual-level data over from index repo, join with populations and cdc weights
+
+Need to do:
+
+* Counts of overdose deaths
+* Population by age to match age groups in CDC weights
+* Rates
+* Age-adjusted rates
+
+```{r}
+cluster_lst <- ct5_clusters %>%
+  split(.$cluster) %>%
+  map(pull, town)
+```
+
+```{r eval=FALSE}
+pop_age <- multi_geo_acs("B01001", regions = cluster_lst) %>%
+  label_acs() %>%
+  separate(label, into = c("total", "sex", "age"), sep = "!!") %>%
+  filter(!is.na(age)) %>%
+  extract(age, into = c("min_age", "max_age"), regex = "^(\\d+)?[\\sA-Za-z]+(\\d+)?") %>%
+  mutate_at(vars(ends_with("_age")), as.numeric) %>%
+  replace_na(list(min_age = 0)) %>%
+  mutate(age_brk = cut(min_age, breaks = c(0, seq(10, 85, by = 5), 100), include.lowest = TRUE, right = FALSE) %>%
+           fct_relabel(age_brks)) %>%
+  group_by(level, name = NAME, age_brk) %>%
+  summarise(pop = sum(estimate))
+
+saveRDS(pop_age, "../raw_data/pop_by_age.rds")
+```
+
+
+```{r}
+pop_age <- readRDS("../raw_data/pop_by_age.rds") %>%
+  ungroup() %>%
+  mutate(level = fct_relabel(level, str_remove, "^\\d+_"))
+
+drugs_indiv <- read_csv("../raw_data/overdoses_indiv_2012_2018.csv") %>%
+  mutate(date = as.Date(date)) %>%
+  mutate_at(vars(town, county), str_to_title) %>%
+  mutate(age_grp = cut(age, breaks = c(0, seq(10, 85, by = 5), 100), right = FALSE) %>%
+           fct_relabel(age_brks))
+
+cdc_wts <- read_csv("../raw_data/cdc_us_standard_pop_weights.csv") %>%
+  mutate(age_grp = as_factor(age_grp) %>%
+           fct_relabel(str_replace, "plus", "99"))
+```
+
+```{r}
+opioid <- bind_rows(
+  drugs_indiv %>% mutate(name = "Connecticut", level = "state"),
+  drugs_indiv %>%
+    left_join(ct5_clusters, by = "town") %>%
+    rename(name = cluster) %>%
+    mutate(level = "regions")
+) %>%
+  mutate(is_opioid = ifelse(is_opioid, "opioids_only", "not_opioid"))
+
+daily_ts <- bind_rows(
+  opioid %>% mutate(is_opioid = "all_drugs"),
+  opioid %>% filter(is_opioid == "opioids_only")
+) %>%
+  count(level, date, name, is_opioid, age_grp) %>%
+  as_tsibble(index = date, key = c(level, name, is_opioid, age_grp)) %>%
+  mutate_if(is.factor, as.character) %>%
+  fill_gaps(n = 0, .full = TRUE) %>%
+  left_join(pop_age, by = c("level", "name", "age_grp" = "age_brk")) %>%
+  left_join(cdc_wts, by = "age_grp")
+
+drugs_ts <- daily_ts %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by(level, name, is_opioid, age_grp, pop, cdc_age_wt) %>%
+  summarise(n = sum(n)) %>%
+  mutate(rate = n / pop * 1e6) %>%
+  group_by(level, name, is_opioid) %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate * cdc_age_wt)) %>% 
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6)) %>%
+  ungroup()
+```
+
+```{r}
+drugs_ts %>%
+  filter(is_opioid == "all_drugs", !is.na(rolling_mean_6mo)) %>%
+  ggplot(aes(x = month, y = rolling_mean_6mo, color = name)) +
+  geom_line() +
+  ggrepel::geom_text_repel(aes(label = name), 
+                           data = . %>% filter(month == max(month)),
+                           direction = "y", hjust = 0, size = 2.8, nudge_x = 30) +
+  scale_x_date(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(x = NULL, title = "Age-adjusted overdose death rate per month per 1 million",
+       subtitle = "6-month rolling average by cluster, 2012–2018") +
+  theme_light() +
+  theme(legend.position = "none")
+```
+
+
+```{r}
+yrs <- 2015:2018
+
+annual_15_18 <- daily_ts %>%
+  index_by(year = year(date)) %>% 
+  filter(between(year, !!!range(yrs))) %>%
+  as_tibble() %>%
+  group_by(level, name, is_opioid, age_grp, pop, cdc_age_wt) %>%
+  summarise(n = sum(n)) %>%
+  mutate(ann_rate = n / pop * 1e5 / length(yrs)) %>%
+  group_by(level, name, is_opioid) %>%
+  summarise(total_n = sum(n),
+            avg_annual_age_adj = sum(ann_rate * cdc_age_wt)) %>% 
+  ungroup() %>%
+  mutate(level = as_factor(level) %>% fct_relevel("state")) %>%
+  arrange(level)
+```
+
+Annualized age-adjusted overdose death rates per year per 100k, 2015–2018
+
+```{r}
+annual_15_18 %>%
+  pivot_wider(names_from = is_opioid, 
+              values_from = c(total_n, avg_annual_age_adj), values_fn = list(avg_annual_age_adj = ~round(., digits = 1))) %>%
+  knitr::kable()
+```
+
+
+```{r}
+drugs_ts %>%
+  mutate_at(vars(level, is_opioid), as_factor) %>%
+  mutate(level = fct_relevel(level, "state")) %>%
+  arrange(level, name) %>%
+  saveRDS("../output_data/drug_overdose_5ct_monthly_ts_1mil.rds")
+
+write_csv(annual_15_18, "../output_data/annual_avg_drug_deaths_100k_2015_2018.csv")
+```
