@@ -141,7 +141,7 @@ op_stops <- data.frame(
   bind_rows(tidytext::stop_words)
 
 # to find opioid
-drug_strs <- c("\\bfen", "44700", "47700", "br?upre?no", "codeine", "fentanil", "fentanyl", "h-morph", "heroi?n", "hyd-?morph", "hydr-?mor", "hydr?o?morph?", "hydro?\\s?morp", "hydrocod", "levorphanol", "meperidine", "methadone", "mor?ph?i+ne", "morph", "morphone", "opiate", "opioi?d", "oxycod", "oxymorph", "percocet", "poppy", "tapentadol", "tramad")
+drug_strs <- c("\\bfen", "44700", "47700", "br?upre?no", "codeine", "fentanil", "fentanyl", "h-morph", "heroi?n", "hyd-?morph", "hydr-?mor", "hydr?o?morph?", "hydro?\\s?morp", "hydrocodone", "hydrocod", "levorphanol", "meperidine", "methadone", "mor?ph?i+ne", "morph", "morphone", "opiate", "opioi?d", "oxycodone", "oxycod", "oxymorph", "percocet", "poppy", "tapentadol", "tramad")
 drug_re <- drug_strs %>%
   paste(collapse = "|") %>%
   sprintf("(%s)", .)
@@ -178,6 +178,30 @@ drugs_out <- drugs %>%
 write_csv(drugs_out, "../output_data/overdoses_indiv_2012_2019.csv")
 ```
 
+```{r}
+drugs %>%
+  select(date:race, town = real_town, county, heroin:cod) %>%
+  gather(key = subs, value, -date:-county, -cod, -other) %>%
+  mutate(value = as.factor(value) %>%
+           fct_collapse(y = c("y pops", "y (ptch)", "y-a", "yes")) %>%
+           fct_other(keep = "y", other_level = "n") %>%
+           fct_explicit_na(na_level = "n")) %>%
+  filter(value == "y") %>%
+  group_by_at(vars(-subs, -value)) %>%
+  summarise(subs_txt = c(subs, other, cod) %>%
+              na.omit() %>%
+              paste(collapse = " ")) %>%
+  ungroup() %>%
+# unnest tokens to remove duplicate words
+  tidytext::unnest_tokens(word, input = subs_txt) %>%
+  distinct() %>%
+  anti_join(op_stops, by = "word") %>%
+  group_by_at(vars(-word)) %>%
+  summarise(subs_txt = paste(word, collapse = " ")) %>%
+  ungroup() %>% 
+  mutate(subs_txt = str_remove(subs_txt, drug_re))
+  
+```
 
 
 
@@ -251,18 +275,31 @@ Age
 ```{r}
 drugs_out %>% count(age_group)
 drugs_out %>%
+  filter(is_opioid) %>% 
   group_by(age_group) %>% 
   count(year = year(date)) %>%
   mutate(yr = paste("1", "1", year, sep = "-") %>% mdy()) %>% 
   ggplot(aes(x = yr, y = n, color=age_group)) +
     geom_line(size=1.0, se = T) +
-    labs(title = "Annual count of overdose deaths by age, 2012-2018",
+    labs(title = "Annual count of opioid overdose deaths by age, 2012-2018",
          subtitle = "Deaths among 25-34 & 35-44 have surpassed 45-54") # how to word?
 ```
 
 Opioid + other substances
 ```{r}
-drugs_out$subs_txt
+# to delete opioids
+drug_strs_2 <- c("oxycodone", "oxymorphone",  "morphine", "tramadol", "fentanyl", "hydrocodone", "opiates", "\\bfen", "44700", "47700", "br?upre?no", "codeine", "fentanil", "fentanyl", "h-morph", "heroi?n", "hyd-?morph", "hydr-?mor", "hydr?o?morph?", "hydro?\\s?morp", "hydrocod", "levorphanol", "meperidine", "methadone", "mor?ph?i+ne", "morph", "morphone", "opiate", "opioi?d", "oxycod", "oxymorph", "percocet", "poppy", "tapentadol", "tramad")
+drug_re_2 <- drug_strs_2 %>%
+  paste(collapse = "|") %>%
+  sprintf("(%s)", .)
+
+drugs_out %>% 
+  mutate(subs_text_2 = str_remove_all(subs_txt, drug_re_2)) %>% 
+  mutate(id = row_number()) %>% 
+  tidytext::unnest_tokens(word, input = subs_txt) %>% 
+  group_by(id) %>% 
+  
+
 ```
 
 
