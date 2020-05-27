@@ -20,6 +20,7 @@ library(cwi)
 library(lubridate)
 ```
 
+
 ## Crosswalks
 ```{r}
 big_vill_xwalk <- readxl::read_excel("../raw_data/match_communities_to_towns.xlsx") %>%
@@ -69,7 +70,6 @@ town2county <- tidycensus::fips_codes %>%
 
 ## Read data
 Reading directly from open data portal
-
 ```{r}
 drugs_read_0 <- RSocrata::read.socrata("https://data.ct.gov/resource/deaths.json") %>% 
   select(date, age, sex, race,
@@ -177,184 +177,6 @@ drugs_out <- drugs %>%
 ```{r}
 write_csv(drugs_out, "../output_data/overdoses_indiv_2012_2019.csv")
 ```
-
-```{r}
-drugs %>%
-  select(date:race, town = real_town, county, heroin:cod) %>%
-  gather(key = subs, value, -date:-county, -cod, -other) %>%
-  mutate(value = as.factor(value) %>%
-           fct_collapse(y = c("y pops", "y (ptch)", "y-a", "yes")) %>%
-           fct_other(keep = "y", other_level = "n") %>%
-           fct_explicit_na(na_level = "n")) %>%
-  filter(value == "y") %>%
-  group_by_at(vars(-subs, -value)) %>%
-  summarise(subs_txt = c(subs, other, cod) %>%
-              na.omit() %>%
-              paste(collapse = " ")) %>%
-  ungroup() %>%
-# unnest tokens to remove duplicate words
-  tidytext::unnest_tokens(word, input = subs_txt) %>%
-  distinct() %>%
-  anti_join(op_stops, by = "word") %>%
-  group_by_at(vars(-word)) %>%
-  summarise(subs_txt = paste(word, collapse = " ")) %>%
-  ungroup() %>% 
-  mutate(subs_txt = str_remove(subs_txt, drug_re))
-  
-```
-
-
-
-
-
-
-
-
-
-## Quick summary stats
-
-Date range: Jan 1, 2012 to Dec 30, 2019
-```{r}
-range(drugs_out$date)
-```
-
-Number of OD deaths (not rate!) has more than triped since 2012.
-```{r}
-drugs_out %>%
-  count(year = year(date))
-```
-
-227% percent increase from 2012 to 2019
-```{r}
-drugs_out %>%
-  count(year = year(date)) %>%
-  filter(year %in% range(year)) %>%
-  spread(key = year, value = n, sep = "_") %>%
-  mutate(change = year_2019 - year_2012,
-         percent_change = change / year_2012)
-```
-
-93 percent of drug related deaths involve opioid/opiate
-```{r}
-drugs_out %>%
-  count(is_opioid) %>%
-  mutate(share = n / sum(n))
-```
-
-74 percent of drug related deaths are men
-```{r}
-drugs_out %>%
-  filter(!is.na(sex)) %>%
-  count(sex) %>%
-  mutate(share = n / sum(n))
-```
-
-93 percent of men who overdosed involved opioids; 91 percent of women
-```{r}
-drugs_out %>%
-  filter(!is.na(sex)) %>%
-  group_by(sex, is_opioid) %>%
-  summarise(n = n()) %>%
-  mutate(share = n / sum(n))
-```
-
-Drug related deaths by race: white 79 percent, Latino 12 percent, Black 8.7 percent, AAPI 0.7 percent.
-57 percent are white men.
-```{r}
-drugs_out %>%
-  count(race) %>%
-  mutate(share = n / sum(n))
-drugs_out %>%
-  filter(!is.na(sex)) %>%
-  count(race, sex) %>%
-  mutate(share = n / sum(n))
-```
-
-Age
-**how to use age-adjusted #s?**
-```{r}
-drugs_out %>% count(age_group)
-drugs_out %>%
-  filter(is_opioid) %>% 
-  group_by(age_group) %>% 
-  count(year = year(date)) %>%
-  mutate(yr = paste("1", "1", year, sep = "-") %>% mdy()) %>% 
-  ggplot(aes(x = yr, y = n, color=age_group)) +
-    geom_line(size=1.0, se = T) +
-    labs(title = "Annual count of opioid overdose deaths by age, 2012-2018",
-         subtitle = "Deaths among 25-34 & 35-44 have surpassed 45-54") # how to word?
-```
-
-Opioid + other substances
-```{r}
-# to delete opioids
-drug_strs_2 <- c("oxycodone", "oxymorphone",  "morphine", "tramadol", "fentanyl", "hydrocodone", "opiates", "\\bfen", "44700", "47700", "br?upre?no", "codeine", "fentanil", "fentanyl", "h-morph", "heroi?n", "hyd-?morph", "hydr-?mor", "hydr?o?morph?", "hydro?\\s?morp", "hydrocod", "levorphanol", "meperidine", "methadone", "mor?ph?i+ne", "morph", "morphone", "opiate", "opioi?d", "oxycod", "oxymorph", "percocet", "poppy", "tapentadol", "tramad")
-drug_re_2 <- drug_strs_2 %>%
-  paste(collapse = "|") %>%
-  sprintf("(%s)", .)
-
-drugs_out %>% 
-  mutate(subs_text_2 = str_remove_all(subs_txt, drug_re_2)) %>% 
-  mutate(id = row_number()) %>% 
-  tidytext::unnest_tokens(word, input = subs_txt) %>% 
-  group_by(id) %>% 
-  
-
-```
-
-
-## Quick plots
-```{r}
-drugs_out %>%
-  count(month = month(date), year = year(date)) %>%
-  mutate(mon_yr = paste(month, "1", year, sep = "-") %>% mdy()) %>%
-  ggplot(aes(x = mon_yr, y = n)) +
-    geom_point() +
-    geom_smooth(method = loess, size = 0.4, se = F) +
-    labs(title = "Monthly count of overdose deaths, 2012-2018")
-```
-
-```{r}
-drugs_out %>%
-  count(month = month(date), year = year(date), is_opioid) %>%
-  mutate(mon_yr = paste(month, "1", year, sep = "-") %>% mdy()) %>%
-  ggplot(aes(x = mon_yr, y = n, color = is_opioid)) +
-    geom_point() +
-    geom_smooth(method = loess, size = 0.4, se = F) +
-    labs(title = "Monthly count of overdose deaths, opioid vs non, 2012-2018")
-```
-
-```{r}
-drugs_out %>%
-  filter(!is.na(sex)) %>%
-  count(month = month(date), year = year(date), sex) %>%
-  mutate(mon_yr = paste(month, "1", year, sep = "-") %>% mdy()) %>%
-  ggplot(aes(x = mon_yr, y = n, color = sex)) +
-    geom_point() +
-    geom_smooth(method = loess, size = 0.4, se = F) +
-    labs(title = "Monthly count of overdose deaths by sex, 2012-2019")
-```
-
-```{r}
-drugs_out %>%
-  count(month = month(date), year = year(date), race) %>%
-  mutate(mon_yr = paste(month, "1", year, sep = "-") %>% mdy()) %>%
-  ggplot(aes(x = mon_yr, y = n, color = race)) +
-    geom_point() +
-    geom_smooth(method = loess, size = 0.4, se = F) +
-    labs(title = "Monthly count of overdose deaths by race, 2012-2019")
-```
-
-```{r}
-drugs_out %>%
-  count(month = month(date), year = year(date)) %>%
-  ggplot(aes(x = month, y = n, fill = as.factor(year))) +
-    geom_area(position = position_stack()) +
-    scale_x_continuous(breaks = 1:12) +
-    labs(title = "Monthly count of deaths, 2012-2019")
-```
-
-
 
 
 
