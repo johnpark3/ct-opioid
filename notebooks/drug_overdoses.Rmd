@@ -2,7 +2,7 @@
 title: "Drug/opioid overdoses"
 output: github_document
 ---
-
+from health_equity
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
 	echo = TRUE,
@@ -19,7 +19,7 @@ library(cwi)
 library(tsibble)
 library(lubridate)
 
-source("../../_utils/misc_functions.R")
+source("../_utils/misc_functions.R")
 ```
 
 
@@ -62,7 +62,7 @@ pop_age <- readRDS("../raw_data/pop_by_age.rds") %>%
   ungroup() %>%
   mutate(level = fct_relabel(level, str_remove, "^\\d+_"))
 
-drugs_indiv <- read_csv("../raw_data/overdoses_indiv_2012_2018.csv") %>%
+drugs_indiv <- read_csv("../output_data/overdoses_indiv_2012_2019.csv") %>%
   mutate(date = as.Date(date)) %>%
   mutate_at(vars(town, county), str_to_title) %>%
   mutate(age_grp = cut(age, breaks = c(0, seq(10, 85, by = 5), 100), right = FALSE) %>%
@@ -117,16 +117,16 @@ drugs_ts %>%
                            direction = "y", hjust = 0, size = 2.8, nudge_x = 30) +
   scale_x_date(expand = expansion(mult = c(0.05, 0.2))) +
   labs(x = NULL, title = "Age-adjusted overdose death rate per month per 1 million",
-       subtitle = "6-month rolling average by cluster, 2012–2018") +
+       subtitle = "6-month rolling average by cluster, 2012–2019") +
   theme_light() +
   theme(legend.position = "none")
 ```
 
 
 ```{r}
-yrs <- 2015:2018
+yrs <- 2015:2019
 
-annual_15_18 <- daily_ts %>%
+annual_15_19 <- daily_ts %>%
   index_by(year = year(date)) %>% 
   filter(between(year, !!!range(yrs))) %>%
   as_tibble() %>%
@@ -144,7 +144,7 @@ annual_15_18 <- daily_ts %>%
 Annualized age-adjusted overdose death rates per year per 100k, 2015–2018
 
 ```{r}
-annual_15_18 %>%
+annual_15_19 %>%
   pivot_wider(names_from = is_opioid, 
               values_from = c(total_n, avg_annual_age_adj), values_fn = list(avg_annual_age_adj = ~round(., digits = 1))) %>%
   knitr::kable()
@@ -158,5 +158,5 @@ drugs_ts %>%
   arrange(level, name) %>%
   saveRDS("../output_data/drug_overdose_5ct_monthly_ts_1mil.rds")
 
-write_csv(annual_15_18, "../output_data/annual_avg_drug_deaths_100k_2015_2018.csv")
+write_csv(annual_15_19, "../output_data/annual_avg_drug_deaths_100k_2015_2019.csv")
 ```

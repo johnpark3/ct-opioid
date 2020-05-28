@@ -1,0 +1,673 @@
+---
+title: "Drug overdoses redo"
+output: github_document
+---
+from 2019index
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	fig.showtext = TRUE
+)
+```
+
+```{r}
+library(tidyverse)
+library(camiller)
+library(cwi)
+library(showtext)
+library(sf)
+library(tidycensus)
+library(lubridate)
+library(tsibble)
+library(feasts)
+```
+
+```{r}
+font_add_google("Roboto Condensed", "roboto")
+showtext_auto()
+tol12 <- ggthemes::ptol_pal()(12)
+source("../../_utils/geographies.R")
+
+region_df <- cwi::regions %>%
+  enframe(name = "region", value = "town") %>%
+  unnest()
+```
+
+```{r}
+age_brks <- function(x) {
+  splits <- x %>%
+    str_remove_all("[\\[\\]\\(\\)]") %>%
+    str_split(",")
+  splits %>%
+    map_chr(function(xs) {
+      x1 <- xs[1]
+      x2 <- as.numeric(xs[2]) - 1
+      sprintf("ages%s_%s", x1, x2)
+    })
+}
+
+# for replacing with wider breaks for rates by race
+age_wide_brks <- list(
+  ages00_14 = c("ages00_09", "ages10_14"),
+  ages15_24 = c("ages15_19", "ages20_24"),
+  ages25_34 = c("ages25_29", "ages30_34"),
+  ages35_44 = c("ages35_39", "ages40_44"),
+  ages45_54 = c("ages45_49", "ages50_54"),
+  ages55_64 = c("ages55_59", "ages60_64"),
+  ages65_74 = c("ages65_69", "ages70_74"),
+  ages75_84 = c("ages75_79", "ages80_84")
+)
+```
+
+
+Need to do:
+
+* Counts of overdose deaths
+* Population by age to match age groups in CDC weights
+* Rates
+* Age-adjusted rates
+
+```{r}
+drugs_indiv <- read_csv("../raw_data/overdoses_indiv_2012_2018.csv") %>%
+  mutate(date = as.Date(date)) %>%
+  mutate_at(vars(town, county), str_to_title) %>%
+  mutate(age_grp = cut(age, breaks = seq(0, 100, by = 5), right = F) %>%
+           fct_relabel(age_brks) %>%
+           fct_collapse(ages00_09 = c("ages0_4", "ages5_9"),
+                        ages85_over = c("ages85_89", "ages90_94", "ages95_99"))) %>%
+  mutate(year = year(date), 
+         is_fentanyl = str_detect(subs_txt, "fent"))
+cdc_wts <- read_csv("../raw_data/cdc_us_standard_pop_weights.csv") %>%
+  mutate(age_grp = as_factor(age_grp) %>%
+           fct_relabel(str_replace, "plus", "over"))
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+pop_read <- c(total = "", white = "H", black = "B", latino = "I") %>%
+  map_chr(~paste0("B01001", .)) %>%
+  map(~multi_geo_acs(table = ., year = 2017, regions = cwi::regions[main_regions])) %>%
+  map(filter, !str_detect(level, "counties")) %>%
+  map(label_acs)
+saveRDS(pop_read, "../raw_data/pop_by_age_race_sex.rds")
+```
+
+```{r}
+pop_read <- readRDS("../raw_data/pop_by_age_race_sex.rds")
+# different age groupings for total pop & by race
+pop_by_age <- pop_read[["total"]] %>%
+  separate(label, into = c("total", "sex", "age"), sep = "!!") %>%
+  filter(!is.na(age) | (is.na(age) & is.na(sex))) %>% 
+  mutate(age = as_factor(age) %>%
+           fct_relabel(str_replace_all, " (to|and) ", "_") %>%
+           fct_relabel(str_remove, " years") %>%
+           fct_relabel(~paste0("ages", .)) %>%
+           fct_collapse(ages00_09 = c("agesUnder 5", "ages5_9"),
+                        ages15_19 = c("ages15_17", "ages18_19"),
+                        ages20_24 = c("ages20", "ages21", "ages22_24"),
+                        ages60_64 = c("ages60_61", "ages62_64"),
+                        ages65_69 = c("ages65_66", "ages67_69")) %>%
+           fct_explicit_na(na_level = "total_pop") %>%
+           fct_relevel("total_pop")) %>%
+  mutate(level = fct_relabel(level, str_remove, "^\\d+_")) %>%
+  group_by(level, name = NAME, age_grp = age) %>%
+  summarise(pop = sum(estimate))
+```
+
+```{r}
+pop_by_age_sex <- pop_read[["total"]] %>%
+  separate(label, into = c("total", "sex", "age"), sep = "!!") %>%
+  filter(!is.na(age)) %>%
+  mutate(age = as_factor(age) %>%
+           fct_relabel(str_replace_all, " (to|and) ", "_") %>%
+           fct_relabel(str_remove, " years") %>%
+           fct_relabel(~paste0("ages", .)) %>%
+           fct_collapse(ages00_09 = c("agesUnder 5", "ages5_9"),
+                        ages15_19 = c("ages15_17", "ages18_19"),
+                        ages20_24 = c("ages20", "ages21", "ages22_24"),
+                        ages60_64 = c("ages60_61", "ages62_64"),
+                        ages65_69 = c("ages65_66", "ages67_69"))) %>%
+  mutate(level = fct_relabel(level, str_remove, "^\\d+_"),
+         sex = as.factor(sex) %>% fct_relabel(str_to_lower)) %>%
+  group_by(level, name = NAME, sex, age_grp = age) %>%
+  summarise(pop = sum(estimate))
+```
+
+```{r}
+pop_by_age_race <- pop_read[c("white", "black", "latino")] %>%
+  bind_rows(.id = "race") %>%
+  separate(label, into = c("total", "sex", "age"), sep = "!!") %>%
+  filter(!is.na(age)) %>%
+  mutate(age = as_factor(age) %>%
+           fct_relabel(str_replace_all, " (to|and) ", "_") %>%
+           fct_relabel(str_remove, " years") %>%
+           fct_relabel(~paste0("ages", .)) %>%
+           fct_collapse(ages00_14 = c("agesUnder 5", "ages5_9", "ages10_14"),
+                        ages15_24 = c("ages15_17", "ages18_19", "ages20_24"),
+                        ages25_34 = c("ages25_29", "ages30_34"))) %>%
+  mutate(level = fct_relabel(level, str_remove, "^\\d+_"),
+         sex = as.factor(sex) %>% fct_relabel(str_to_lower)) %>%
+  group_by(level, name = NAME, sex, race, age_grp = age) %>%
+  summarise(pop = sum(estimate))
+
+cdc_wt_race <- cdc_wts %>%
+  mutate(age_grp = fct_collapse(age_grp, !!!age_wide_brks)) %>%
+  group_by(age_grp) %>%
+  summarise_all(sum)
+```
+
+Make a time series object with lots of groupings included (sex, age), then rollup later when I don't need disaggregations. Keeping a separate time series for counts by race, since ages are different.
+
+*6/21*: adding in large towns with high counts. Filtering for towns with average 25 deaths per year--totally arbitrary, but gets 5 major towns to highlight.
+
+```{r message=TRUE, warning=TRUE}
+city_min_n <- 25
+cities <- drugs_indiv %>%
+  group_by(town, year) %>%
+  summarise(n = n()) %>%
+  summarise(avg_n = mean(n)) %>%
+  filter(avg_n >= city_min_n)
+drugs_ts <- bind_rows(
+  drugs_indiv %>% 
+    mutate(name = "Connecticut", level = "state"),
+  drugs_indiv %>% 
+    inner_join(region_df, by = "town") %>% 
+    rename(name = region) %>%
+    mutate(level = "regions"),
+  drugs_indiv %>% 
+    semi_join(cities, by = "town") %>%
+    rename(name = town) %>%
+    mutate(level = "towns")
+) %>%
+  mutate(level = as_factor(level)) %>%
+  # mutate_at(vars(region, sex), as_factor) %>%
+  count(date, level, name, sex, age_grp, is_opioid, is_fentanyl) %>%
+  as_tsibble(index = date, key = c(level, name, sex, age_grp, is_opioid, is_fentanyl)) %>%
+  fill_gaps(n = 0, .full = T)
+
+# need to redo age breaks for by race
+drugs_race_ts <- bind_rows(
+  drugs_indiv %>% mutate(name = "Connecticut", level = "state"),
+  drugs_indiv %>% inner_join(region_df, by = "town") %>% mutate(level = "regions") %>% rename(name = region)
+) %>%
+  filter(race != "other_unknown") %>%
+  mutate(age_grp = fct_collapse(age_grp, !!!age_wide_brks)) %>%
+  count(date, level, name, sex, race, age_grp) %>%
+  as_tsibble(index = date, key = c(level, name, sex, race, age_grp), .drop = T) %>%
+  fill_gaps(n = 0, .full = T)
+
+out <- list()
+```
+
+```{r fig.width=7, fig.height=7}
+out$trend_all <- drugs_ts %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by(level, name, age_grp) %>%
+  summarise(n = sum(n)) %>% 
+  inner_join(pop_by_age, by = c("name", "age_grp", "level")) %>% 
+  mutate(rate_100k = (n / pop) * 1e5) %>%
+  left_join(cdc_wts, by = "age_grp") %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate_100k * cdc_age_wt)) %>%
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6)) %>%
+  ungroup()
+
+out$trend_all %>%
+  select(-monthly_n) %>%
+  mutate(name = as_factor(name) %>% fct_reorder2(month, monthly_age_adj, .fun = max)) %>%
+  # filter(!str_detect(name, "Ring")) %>%
+  gather(key, value, monthly_age_adj, rolling_mean_6mo) %>%
+  ggplot(aes(x = month, y = value, alpha = key)) +
+  geom_line(color = tol12[1]) +
+  scale_alpha_manual(values = c(monthly_age_adj = 0.3, rolling_mean_6mo = 0.9)) +
+  theme_din() +
+  facet_wrap(vars(fct_rev(name))) +
+  labs(title = "Monthly age-adjusted rate of overdose deaths",
+       subtitle = "Per 100k, with 6 month rolling average") +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r}
+out$trend_sex <- drugs_ts %>%
+  filter(sex != "unknown") %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by(level, name, sex, age_grp) %>%
+  summarise(n = sum(n)) %>% 
+  inner_join(pop_by_age_sex, by = c("name", "level", "sex", "age_grp")) %>% 
+  mutate(rate_100k = (n / pop) * 1e5) %>%
+  left_join(cdc_wts, by = "age_grp") %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate_100k * cdc_age_wt)) %>%
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6)) %>%
+  ungroup()
+
+out$trend_sex %>%
+  filter(!str_detect(name, "Ring"), level != "towns") %>%
+  select(-monthly_n) %>%
+  mutate(name = as_factor(name) %>% fct_reorder2(month, monthly_age_adj, .fun = max)) %>%
+  gather(key, value, monthly_age_adj, rolling_mean_6mo) %>%
+  ggplot(aes(x = month, y = value, color = sex, alpha = key)) +
+  geom_line() +
+  scale_color_manual(values = tol12[c(1, 11)]) +
+  scale_alpha_manual(values = c(monthly_age_adj = 0.3, rolling_mean_6mo = 0.9)) +
+  theme_din() +
+  facet_wrap(vars(fct_rev(name))) +
+  labs(title = "Monthly age-adjusted rate of overdose deaths",
+       subtitle = "By sex per 100k, with 6 month rolling average") +
+  theme(legend.position = "bottom")
+
+```
+
+Getting into smaller groups on a monthly scale brings in too much noise to plot easily
+
+```{r}
+out$trend_race <- drugs_race_ts %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by_key() %>%
+  summarise(n = sum(n)) %>% 
+  inner_join(pop_by_age_race, by = c("level", "name", "sex", "race", "age_grp")) %>% 
+  group_by(level, name, race, age_grp) %>%
+  summarise_at(vars(n, pop), sum) %>%
+  mutate(rate_100k = (n / pop) * 1e5) %>%
+  left_join(cdc_wt_race, by = "age_grp") %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate_100k * cdc_age_wt)) %>%
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6)) %>%
+  ungroup()
+
+out$trend_race %>%
+  filter(!str_detect(name, "Ring")) %>%
+  mutate(name = as_factor(name) %>% fct_reorder2(month, monthly_age_adj, .fun = max)) %>%
+  # gather(key, value, monthly_age_adj, rolling_mean_6mo) %>%
+  ggplot(aes(x = month, y = rolling_mean_6mo, color = race)) +
+  geom_line() +
+  scale_color_manual(values = tol12[c(5, 9, 1)]) +
+  # scale_alpha_manual(values = c(monthly_age_adj = 0.3, rolling_mean_6mo = 0.9)) +
+  theme_din() +
+  facet_wrap(vars(name)) +
+  labs(title = "Monthly age-adjusted rate of overdose deaths",
+       subtitle = "By sex per 100k, 6 month rolling average only") +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+
+
+
+Comparing towns in the most recent few years, 2015-2018
+
+Suppressing to only compare towns with
+
+* avg 1 or more death per year
+* population of at least 3,000
+
+```{r}
+yrs <- 2015:2018
+min_pop <- 3000
+ann_age_adj_15_18 <- bind_rows(
+  drugs_indiv %>% mutate(name = "Connecticut", level = "state"),
+  drugs_indiv %>% inner_join(region_df, by = "town") %>% rename(name = region) %>% mutate(level = "regions"),
+  drugs_indiv %>% rename(name = town) %>% mutate(level = "towns")
+) %>%
+  ungroup() %>%
+  filter(year %in% yrs) %>%
+  mutate(is_opioid = if_else(is_opioid, "opiate_opioid", "no_opiate_opioid")) %>%
+  bind_self(group = is_opioid, new_value = "any_substance", append = F) %>%
+  count(level, name, is_opioid, age_grp) %>%
+  complete(nesting(level, name), age_grp, is_opioid, fill = list(n = 0)) %>%
+  inner_join(pop_by_age %>%
+              ungroup() %>%
+              select(-level), by = c("name", "age_grp")) %>%
+  mutate(ann_rate100k = (n / pop) * 1e5 / length(yrs)) %>%
+  left_join(cdc_wts, by = c("age_grp")) %>%
+  group_by(level, name, is_opioid) %>%
+  summarise(n = sum(n),
+            pop = sum(pop),
+            ann_crude_rate100k = (n / pop) * 1e5 / length(yrs),
+            ann_age_adj_rate100k = sum(ann_rate100k * cdc_age_wt)) %>%
+  mutate_at(vars(ends_with("rate100k")), round, digits = 1) %>%
+  ungroup()
+
+ann_age_adj_15_18 %>%
+  filter(level == "towns", 
+         is_opioid == "any_substance",
+         n >= length(yrs), pop >= min_pop) %>%
+  full_join(town_sf, by = "name") %>%
+  mutate(rate_brk = classInt::classIntervals(ann_age_adj_rate100k, n = 5, style = "jenks")$brks %>%
+           cut(ann_age_adj_rate100k, breaks = ., include.lowest = T)) %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(aes(fill = rate_brk), size = 0.2, color = "white") +
+  coord_sf(ndiscr = 0) +
+  theme_din() +
+  scale_fill_brewer(palette = "Blues", na.value = "gray80") +
+  labs(title = "Annualized age-adjusted overdose death rate, 2015-2018",
+       fill = "Rate per 100k")
+```
+
+Issue might be more dire in smaller cities (New Britain, New London, Norwalk) than larger cities like New Haven & Bridgeport--this is why we compare towns by rate, not raw count.
+
+#### Highest *count* of overdose deaths by town, 2015-2018
+
+```{r}
+ann_age_adj_15_18 %>%
+  filter(level == "towns", is_opioid == "any_substance") %>%
+  top_n(10, n) %>%
+  arrange(-n) %>%
+  knitr::kable()
+```
+
+Obviously high counts are in larger cities. But Hartford & Waterbury counts are higher than largest cities (Bridgeport, New Haven), and Stamford isn't even in top 10.
+
+#### Highest *rate* of overdose deaths by town, 2015-2018
+
+Of towns with average 1 death per year, 3,000+ population
+
+```{r}
+ann_age_adj_15_18 %>%
+  filter(level == "towns", 
+         is_opioid == "any_substance",
+         n >= length(yrs), pop >= min_pop) %>%
+  top_n(10, ann_age_adj_rate100k) %>%
+  arrange(-ann_age_adj_rate100k) %>%
+  knitr::kable()
+```
+
+## Is cause of death changing?
+
+```{r}
+out$trend_opioid <- drugs_ts %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by(level, name, is_opioid, age_grp) %>%
+  summarise(n = sum(n)) %>% 
+  inner_join(pop_by_age, by = c("level", "name", "age_grp")) %>% 
+  mutate(rate_100k = (n / pop) * 1e5) %>%
+  left_join(cdc_wts, by = "age_grp") %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate_100k * cdc_age_wt)) %>%
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6))
+
+out$trend_opioid %>%
+  filter(!str_detect(name, "Ring")) %>%
+  select(-monthly_n) %>%
+  gather(key, value, monthly_age_adj, rolling_mean_6mo) %>%
+  ggplot(aes(x = month, y = value, color = is_opioid, alpha = key)) +
+  geom_line() +
+  scale_color_manual(values = tol12[c(1, 11)]) +
+  scale_alpha_manual(values = c(monthly_age_adj = 0.3, rolling_mean_6mo = 0.9)) +
+  theme_din() +
+  facet_wrap(vars(name)) +
+  labs(title = "Monthly age-adjusted rate of overdose deaths",
+       subtitle = "By presence of opioid per 100k, with 6 month rolling average") +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+Have non-opioid deaths also gone up?
+
+```{r}
+drugs_indiv %>%
+  count(year = year(date), is_opioid) %>%
+  filter(year %in% range(year)) %>%
+  spread(key = year, value = n, sep = "_") %>%
+  mutate(percent_change = (year_2018 - year_2012) / year_2012) %>%
+  knitr::kable()
+```
+
+Slightly. 17 percent increase in number of non-opioid deaths; 215 percent increase in number of opioid-related.
+
+How has fentanyl factored in?
+
+```{r}
+out$trend_fentanyl <- drugs_ts %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(month = yearmonth(date)) %>% 
+  group_by(level, name, is_fentanyl, age_grp) %>%
+  summarise(n = sum(n)) %>% 
+  inner_join(pop_by_age, by = c("level", "name", "age_grp")) %>% 
+  mutate(rate_100k = (n / pop) * 1e5) %>%
+  left_join(cdc_wts, by = "age_grp") %>%
+  summarise(monthly_n = sum(n),
+            monthly_age_adj = sum(rate_100k * cdc_age_wt)) %>%
+  group_by_key() %>%
+  mutate(rolling_mean_6mo = slide_dbl(monthly_age_adj, mean, .size = 6))
+
+out$trend_fentanyl %>%
+  filter(!str_detect(name, "Ring")) %>%
+  select(-monthly_n) %>%
+  gather(key, value, monthly_age_adj, rolling_mean_6mo) %>%
+  ggplot(aes(x = month, y = value, color = is_fentanyl, alpha = key)) +
+  geom_line() +
+  scale_color_manual(values = tol12[c(1, 11)]) +
+  scale_alpha_manual(values = c(monthly_age_adj = 0.3, rolling_mean_6mo = 0.9)) +
+  theme_din() +
+  facet_wrap(vars(name)) +
+  labs(title = "Monthly age-adjusted rate of overdose deaths",
+       subtitle = "By presence of fentanyl per 100k, with 6 month rolling average") +
+  theme(legend.position = "bottom")
+```
+
+```{r fig.width=7, fig.height=7}
+month6_fentanyl_n <- drugs_ts %>%
+  # filter(region == "Connecticut") %>%
+  mutate_if(is.factor, as.character) %>%
+  index_by(mo6 = floor_date(date, "6 months")) %>%
+  group_by(level, name, is_fentanyl) %>%
+  summarise(n = sum(n)) %>%
+  as_tibble() %>%
+  group_by(level, name, mo6)
+
+month6_fentanyl_n %>%
+  filter(name %in% str_subset(main_regions, "Ring", negate = T)) %>%
+  mutate(share = n / sum(n)) %>%
+  ggplot(aes(x = mo6, y = n, fill = is_fentanyl)) + 
+  geom_col(alpha = 0.9) +
+  geom_text(aes(label = scales::percent(share, accuracy = 1)), 
+            data = . %>% filter(is_fentanyl),
+            vjust = -0.1, family = "roboto", size = 2.8) +
+  theme_din() +
+  scale_fill_manual(values = tol12[c(3, 11)]) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  facet_wrap(vars(name), scales = "free_y", ncol = 2) +
+  labs(title = "Count of deaths by presence of fentanyl",
+       subtitle = "6-month totals, 2012-2018\nWith share of deaths that involve fentanyl",
+       x = NULL) +
+  theme(legend.position = "bottom")
+```
+
+^^ I'd like to include a chart like this in the reports—this is a situation where just looking at numbers doesn't convey the magnitude of the problem.
+
+Fentanyl was listed in reports for 4 percent of deaths in 2012, jumped to 21 percent of deaths in the first half of 2015, and has climbed since then to 78 percent of deaths in the second half of 2018. The number of deaths that do not involve fentanyl has decreased. As much as we talk about fentanyl in & around New Haven, our region has actually been hit less hard by it than Greater Hartford.
+
+
+```{r}
+drugs_indiv %>%
+  count(year = year(date), is_fentanyl) %>%
+  filter(year %in% range(year)) %>%
+  spread(key = year, value = n, sep = "_") %>%
+  mutate(percent_change = (year_2018 - year_2012) / year_2012) %>%
+  knitr::kable()
+```
+
+Only 13 fentanyl-related deaths in 2012, 703 in 2018. Although I wonder if medical examiners weren't looking out for it until more recently.
+
+Crappy bumpchart of ranking of words included in descriptions each year
+
+```{r}
+drugs_indiv %>%
+  select(year, subs_txt) %>%
+  mutate(subs_txt = str_remove_all(subs_txt, "anyopioid")) %>%
+  tidytext::unnest_tokens(output = word, input = subs_txt) %>%
+  count(year, word) %>%
+  arrange(year, -n) %>%
+  group_by(year) %>%
+  mutate(rnk = rank(-n)) %>%
+  ungroup() %>%
+  (function(df) semi_join(df, df %>% filter(year == 2018, rnk <= 5), by = "word")) %>%
+  mutate(word = as_factor(word) %>%
+           fct_reorder2(desc(year), n, max, .desc = T)) %>%
+  ggplot(aes(x = year, y = rnk, color = word)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  scale_y_reverse(breaks = 11:1) +
+  scale_color_manual(values = tol12[c(1, 3, 5, 6, 8, 12)]) +
+  theme_din(xgrid = T) +
+  labs(title = "Ranking of frequency of words in overdose death descriptions",
+       subtitle = "Statewide, keywords in 2018's top 5, 2012-2018",
+       y = "Rank",
+       x = NULL)
+```
+
+
+
+```{r}
+ann_age_adj_race_15_18 <- drugs_race_ts %>%
+  filter(year(date) %in% yrs) %>%
+  as_tibble() %>%
+  group_by_at(vars(level:age_grp)) %>%
+  summarise(n = sum(n)) %>%
+  filter(sex != "unknown") %>%
+  complete(nesting(level, name), sex, race, age_grp, fill = list(n = 0)) %>%
+  inner_join(pop_by_age_race, by = c("level", "name", "sex", "race", "age_grp")) %>%
+  group_by(level, name, race, age_grp) %>%
+  summarise_at(vars(n, pop), sum) %>%
+  mutate(rate_100k = (n / pop) * 1e5,
+         ann_rate_100k = rate_100k / length(yrs)) %>%
+  left_join(cdc_wt_race, by = "age_grp") %>%
+  group_by(level, name, race) %>%
+  summarise(n = sum(n),
+            pop = sum(pop),
+            ann_crude_rate100k = (n / pop) * 1e5 / length(yrs),
+            ann_age_adj_rate100k = sum(ann_rate_100k * cdc_age_wt)) %>%
+  ungroup() %>%
+  mutate_at(vars(level, race), as.factor) %>%
+  mutate_at(vars(ends_with("rate100k")), round, digits = 1) %>%
+  mutate(level = fct_relevel(level, "state"),
+         race = fct_relevel(race, "white", "black")) %>%
+  arrange(level, name, race)
+```
+
+```{r}
+ann_age_adj_race_15_18 %>%
+  mutate(name = as.factor(name) %>% fct_reorder(ann_age_adj_rate100k, max)) %>%
+  ggplot(aes(x = name, y = ann_age_adj_rate100k, color = race)) +
+  geom_point(size = 2.5, alpha = 0.9) +
+  coord_flip() +
+  theme_din(xgrid = T) +
+  labs(title = "Drug overdose rate by race",
+       subtitle = "Annualized age-adjusted rate per 100k, 2015-2018") +
+  scale_color_manual(values = tol12[c(1, 6, 3)])
+```
+
+## Output
+
+```{r}
+bind_rows(
+  ann_age_adj_15_18 %>% mutate(type = "by_substance", race = "all"),
+  ann_age_adj_race_15_18 %>% mutate(type = "by_race", is_opioid = "any_substance")
+) %>%
+  select(type, level, name, race, is_opioid, everything()) %>%
+  mutate_at(vars(type, level, race, is_opioid), as_factor) %>%
+  mutate(level = fct_relevel(level, "state"),
+         race = fct_relevel(race, "all", "white")) %>%
+  arrange(type, level, name, race, is_opioid) %>%
+  filter(n >= length(yrs), pop >= min_pop) %>%
+  rename_all(str_replace, "ann", "annualized") %>%
+  split(.$type) %>%
+  saveRDS("../output_data/age_adj_drug_deaths_2015_2018.rds")
+```
+
+
+
+```{r}
+saveRDS(out, "../output_data/drug_overdose_age_adj_time_series_by_group_2012_2018.rds")
+```
+
+Adding in median age at time of death by race & by sex
+
+```{r}
+median_age <- drugs_indiv %>%
+  inner_join(region_df %>% filter(region %in% c("Fairfield County", "Greater New Haven", "Greater Hartford", "Lower Naugatuck Valley")),
+            by = "town") %>%
+  bind_rows(drugs_indiv %>% mutate(region = "Connecticut")) %>%
+  bind_self(group = sex, new_value = "all") %>%
+  bind_self(group = race, new_value = "all") %>%
+  filter(sex != "unknown") %>%
+  group_by(region, sex, race) %>%
+  summarise(median_age = median(age, na.rm = T))
+
+write_csv(median_age, "../output_data/median_age_drug_overdose_2012_2018.csv")
+```
+
+Adding in YPLL due to opioids, to compare to other causes of death, for 2015–2018
+
+```{r}
+ypll <- readRDS("../output_data/annualized_ypll_rates_2010_2014.rds")
+ypll_pops <- ypll %>%
+  filter(cause == "All") %>%
+  select(name, total_pop, pop_under75)
+ypll_yrs <- 2015:2018
+
+opioid_ypll <- drugs_indiv %>%
+  inner_join(region_df, by = "town") %>%
+  bind_rows(drugs_indiv %>% mutate(region = "Connecticut")) %>%
+  filter(is_opioid, year %in% ypll_yrs) %>%
+  mutate(is_under75 = age < 75,
+         yrs_lost = if_else(is_under75, 75 - age, NA_real_)) %>%
+  group_by(name = region, cause = "Opioids") %>%
+  summarise(dths = n(), 
+            dths = n(), 
+            d75 = sum(is_under75), 
+            average75 = mean(yrs_lost, na.rm = T) %>% round(digits = 1),
+            ###### important: this yrs_lost is over 4 years, not 5
+            yrs_lost = sum(yrs_lost, na.rm = T)) %>%
+  ungroup() %>%
+  inner_join(ypll_pops, by = "name") %>%
+  mutate(ann_ypll_100k = (yrs_lost / pop_under75 / length(ypll_yrs)) * 1e5) %>%
+  select(-yrs_lost) %>%
+  bind_rows(ypll %>% filter(name %in% main_regions) %>% select(-level, -category, -rate100k)) %>%
+  mutate(name = as_factor(name)) %>%
+  group_by(name) %>%
+  mutate(rank = rank(-ann_ypll_100k)) %>%
+  filter(rank <= 6 | cause == "Opioids") %>%
+  ungroup() %>%
+  arrange(name, -ann_ypll_100k)
+```
+
+
+
+```{r}
+opioid_ypll %>%
+  filter(cause != "All") %>%
+  mutate(cause = as_factor(cause) %>% fct_reorder(ann_ypll_100k, mean),
+         name = fct_reorder(name, ann_ypll_100k, max)) %>%
+  ggplot(aes(x = name, y = ann_ypll_100k, color = cause, shape = cause)) +
+  geom_point(size = 3, alpha = 0.9) +
+  coord_flip() +
+  scale_shape_manual(values = c("triangle", rep("bullet", 4))) +
+  scale_color_manual(values = tol12[c(1, 3, 6, 9, 7)]) +
+  theme_din(xgrid = T, ygrid = T)
+```
+
+```{r}
+opioid_ypll %>%
+  knitr::kable()
+```
+
